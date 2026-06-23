@@ -1,15 +1,13 @@
 {
   "name": "@theyahia/kontur-diadoc-mcp",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "MCP server for Kontur.Diadoc — electronic document interchange, EDI (Russia)",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
     "kontur-diadoc-mcp": "dist/index.js"
   },
-  "files": [
-    "dist"
-  ],
+  "files": ["dist"],
   "engines": {
     "node": ">=18.0.0"
   },
@@ -18,6 +16,9 @@
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
     "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "format": "biome check --write .",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
@@ -25,6 +26,7 @@
     "zod": "^3.24.0"
   },
   "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
     "@types/node": "^22.0.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
