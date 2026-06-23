@@ -1,39 +1,80 @@
-const BASE_URL = "https://diadoc-api.kontur.ru";
-const TIMEOUT = 15_000;
+import { getApiClientId, getBaseUrl, getCredentials } from "./config.js";
+
+const TIMEOUT_MS = 15_000;
 const MAX_RETRIES = 3;
+/** Diadoc tokens are valid for ~24h; refresh a little early to be safe. */
+const TOKEN_TTL_MS = 23 * 60 * 60 * 1000;
 
-let cachedToken: string | null = null;
+interface CachedToken {
+  value: string;
+  expiresAt: number;
+}
 
+let cachedToken: CachedToken | null = null;
+
+/** Error carrying the HTTP status and any response body Diadoc returned, for friendlier messages. */
+export class DiadocError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly statusText: string,
+    public readonly detail = "",
+  ) {
+    const suffix = detail ? `: ${truncate(detail, 500)}` : "";
+    super(`Diadoc HTTP ${status} ${statusText}${suffix}`);
+    this.name = "DiadocError";
+  }
+}
+
+function truncate(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max)}…` : text;
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
+function backoffDelay(attempt: number): number {
+  return Math.min(1000 * 2 ** (attempt - 1), 8000);
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Authenticate against Diadoc with login/password and cache the token.
+ *
+ * Correct request shape (per developer.kontur.ru/doc/diadoc-api):
+ *   POST /V3/Authenticate?type=password
+ *   Authorization: DiadocAuth ddauth_api_client_id=<developer key>
+ *   body: { "login": "...", "password": "..." }
+ * The token is returned in the response body and is reused until it expires or a 401 occurs.
+ */
 export async function authenticate(): Promise<string> {
-  if (cachedToken) return cachedToken;
-
-  const clientId = process.env.DIADOC_CLIENT_ID;
-  const apiKey = process.env.DIADOC_API_KEY;
-  const login = process.env.DIADOC_LOGIN;
-  const password = process.env.DIADOC_PASSWORD;
-
-  if (!clientId || !apiKey) {
-    throw new Error("DIADOC_CLIENT_ID and DIADOC_API_KEY are required.");
-  }
-  if (!login || !password) {
-    throw new Error("DIADOC_LOGIN and DIADOC_PASSWORD are required.");
+  if (cachedToken && cachedToken.expiresAt > Date.now()) {
+    return cachedToken.value;
   }
 
-  const response = await fetch(`${BASE_URL}/V3/Authenticate`, {
+  const { apiClientId, login, password } = getCredentials();
+
+  const response = await fetch(`${getBaseUrl()}/V3/Authenticate?type=password`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "ddauth_api_client_id": clientId,
+      Authorization: `DiadocAuth ddauth_api_client_id=${apiClientId}`,
     },
     body: JSON.stringify({ login, password }),
   });
 
   if (!response.ok) {
-    throw new Error(`Diadoc authentication failed: HTTP ${response.status}`);
+    const detail = await response.text().catch(() => "");
+    throw new DiadocError(response.status, response.statusText || "authentication failed", detail);
   }
 
-  const token = await response.text();
-  cachedToken = token;
+  const token = (await response.text()).trim();
+  if (!token) {
+    throw new Error("Diadoc authentication returned an empty token.");
+  }
+
+  cachedToken = { value: token, expiresAt: Date.now() + TOKEN_TTL_MS };
   return token;
 }
 
@@ -41,91 +82,94 @@ export function clearToken(): void {
   cachedToken = null;
 }
 
-function getHeaders(token: string): Record<string, string> {
-  const clientId = process.env.DIADOC_CLIENT_ID!;
+function authHeaders(token: string): Record<string, string> {
   return {
-    "Authorization": `DiadocAuth ddauth_api_client_id=${clientId},ddauth_token=${token}`,
+    Authorization: `DiadocAuth ddauth_api_client_id=${getApiClientId()},ddauth_token=${token}`,
     "Content-Type": "application/json",
-    "Accept": "application/json",
+    Accept: "application/json",
   };
 }
 
-export async function diadocGet(path: string, params: Record<string, string> = {}): Promise<unknown> {
-  const token = await authenticate();
-  const query = new URLSearchParams(params);
-  const url = `${BASE_URL}${path}${query.toString() ? "?" + query.toString() : ""}`;
-
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), TIMEOUT);
-
-    try {
-      const response = await fetch(url, {
-        headers: getHeaders(token),
-        signal: controller.signal,
-      });
-      clearTimeout(timer);
-
-      if (response.ok) return response.json();
-
-      if (response.status === 401) {
-        clearToken();
-        throw new Error("Diadoc: authentication expired. Re-authenticate.");
-      }
-
-      if ((response.status === 429 || response.status >= 500) && attempt < MAX_RETRIES) {
-        const delay = Math.min(1000 * 2 ** (attempt - 1), 8000);
-        await new Promise(r => setTimeout(r, delay));
-        continue;
-      }
-
-      throw new Error(`Diadoc HTTP ${response.status}: ${response.statusText}`);
-    } catch (error) {
-      clearTimeout(timer);
-      if (error instanceof DOMException && error.name === "AbortError" && attempt < MAX_RETRIES) continue;
-      throw error;
-    }
+function parseBody(text: string): unknown {
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { raw: text };
   }
-  throw new Error("Diadoc: all retry attempts exhausted");
 }
 
-export async function diadocPost(path: string, body: unknown, params: Record<string, string> = {}): Promise<unknown> {
-  const token = await authenticate();
+interface RequestOptions {
+  params?: Record<string, string>;
+  body?: unknown;
+}
+
+/**
+ * Perform an authenticated Diadoc request with timeout, exponential backoff on
+ * 429/5xx, and a single transparent re-authentication on 401.
+ */
+async function diadocRequest(
+  method: "GET" | "POST",
+  path: string,
+  { params = {}, body }: RequestOptions = {},
+): Promise<unknown> {
+  let token = await authenticate();
+  let reauthenticated = false;
+
   const query = new URLSearchParams(params);
-  const url = `${BASE_URL}${path}${query.toString() ? "?" + query.toString() : ""}`;
+  const url = `${getBaseUrl()}${path}${query.toString() ? `?${query.toString()}` : ""}`;
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), TIMEOUT);
+    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
 
     try {
       const response = await fetch(url, {
-        method: "POST",
-        headers: getHeaders(token),
-        body: JSON.stringify(body),
+        method,
+        headers: authHeaders(token),
+        body: body !== undefined ? JSON.stringify(body) : undefined,
         signal: controller.signal,
       });
       clearTimeout(timer);
 
-      if (response.ok) return response.json();
-
-      if (response.status === 401) {
-        clearToken();
-        throw new Error("Diadoc: authentication expired.");
+      if (response.ok) {
+        return parseBody(await response.text());
       }
 
-      if ((response.status === 429 || response.status >= 500) && attempt < MAX_RETRIES) {
-        const delay = Math.min(1000 * 2 ** (attempt - 1), 8000);
-        await new Promise(r => setTimeout(r, delay));
+      // Token expired/invalid: drop it, re-authenticate once, and retry the request.
+      if (response.status === 401 && !reauthenticated) {
+        clearToken();
+        token = await authenticate();
+        reauthenticated = true;
         continue;
       }
 
-      throw new Error(`Diadoc HTTP ${response.status}: ${response.statusText}`);
+      if ((response.status === 429 || response.status >= 500) && attempt < MAX_RETRIES) {
+        await sleep(backoffDelay(attempt));
+        continue;
+      }
+
+      const detail = await response.text().catch(() => "");
+      throw new DiadocError(response.status, response.statusText, detail);
     } catch (error) {
       clearTimeout(timer);
-      if (error instanceof DOMException && error.name === "AbortError" && attempt < MAX_RETRIES) continue;
+      if (error instanceof DiadocError) throw error;
+      if (isAbortError(error) && attempt < MAX_RETRIES) continue;
       throw error;
     }
   }
-  throw new Error("Diadoc: all retry attempts exhausted");
+
+  throw new Error(`Diadoc: all ${MAX_RETRIES} retry attempts exhausted for ${method} ${path}`);
+}
+
+export function diadocGet(path: string, params: Record<string, string> = {}): Promise<unknown> {
+  return diadocRequest("GET", path, { params });
+}
+
+export function diadocPost(
+  path: string,
+  body: unknown,
+  params: Record<string, string> = {},
+): Promise<unknown> {
+  return diadocRequest("POST", path, { params, body });
 }
