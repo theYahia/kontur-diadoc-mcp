@@ -1,10 +1,11 @@
-# @theyahia/kontur-diadoc-mcp
+# MCP-сервер для Контур.Диадок — электронный документооборот (ЭДО) через ИИ
 
 [![CI](https://github.com/theYahia/kontur-diadoc-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/theYahia/kontur-diadoc-mcp/actions/workflows/ci.yml)
 
-MCP-сервер для **Kontur.Diadoc** — электронного документооборота (ЭДО / EDI) для российского
-бизнеса. Поиск организаций и контрагентов, просмотр, отправка и подписание документов
-(счета-фактуры, акты, УПД, ТОРГ-12 и др.) прямо из AI-ассистента.
+Если вы искали, как подключить Диадок к нейросети, достать счета-фактуры и УПД из ЭДО не кликая
+по кабинету или подписать документ из чата — это оно. 12 инструментов: поиск контрагентов по ИНН,
+список и содержимое документов, отправка и подписание (счета-фактуры, акты, УПД, ТОРГ-12 и др.).
+Пишете «покажи входящие УПД за март» — получаете список, а не инструкцию, куда нажать.
 
 > MCP server for **Kontur.Diadoc** electronic document interchange (EDI). Search organizations
 > and counterparties, list/fetch documents, send and sign them — straight from your AI assistant.
