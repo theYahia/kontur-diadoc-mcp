@@ -128,3 +128,7 @@ npm run format     # biome check --write . (автоформат + фиксы)
 ## Лицензия / License
 
 MIT
+
+---
+
+Часть [WWmcp](https://github.com/theYahia/WWmcp) · Telegram: [@vhodvai](https://t.me/vhodvai)
